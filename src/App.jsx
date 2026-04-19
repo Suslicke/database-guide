@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from "react";
+import { trackEvent, setAnalyticsUser, setAnalyticsConsent } from "./analytics.js";
 
 /*───────────────────────────────────────────────────────────
   DATA
@@ -1460,10 +1461,86 @@ export default function App() {
   const [wizStep, setWizStep] = useState(0);
   const [wizAns, setWizAns] = useState([]);
 
+  // ============== EXTRA FEATURES ==============
+  const [bookmarked, setBookmarked] = useState(initial.bookmarked || {});       // { topicId: true }
+  const [confidence, setConfidence] = useState(initial.confidence || {});       // { topicId: 'easy'|'medium'|'hard' }
+  const [username, setUsername] = useState(initial.username || "");
+  const [bookmarksOnly, setBookmarksOnly] = useState(false);                    // session filter, not persisted
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [analyticsOn, setAnalyticsOn] = useState(() => {
+    try { return localStorage.getItem("db-analytics") !== "denied"; } catch { return true; }
+  });
+  // Quiz: { ids: [topicId, ...], idx, results: {easy,medium,hard}, revealed }
+  const [quizState, setQuizState] = useState(null);
+  const [readFontScale, setReadFontScale] = useState(1);
+
   // Persist progress on every change (cheap — just a JSON.stringify of small objects).
   useEffect(() => { saveStored({ checked }); }, [checked]);
   useEffect(() => { saveStored({ expanded }); }, [expanded]);
   useEffect(() => { saveStored({ levelFilter }); }, [levelFilter]);
+  useEffect(() => { saveStored({ bookmarked }); }, [bookmarked]);
+  useEffect(() => { saveStored({ confidence }); }, [confidence]);
+  useEffect(() => { saveStored({ username }); }, [username]);
+
+  // Forward username to analytics (debounced 400ms).
+  useEffect(() => {
+    const t = setTimeout(() => setAnalyticsUser(username), 400);
+    return () => clearTimeout(t);
+  }, [username]);
+
+  // ============== HELPERS for new features ==============
+  const toggleBookmark = (id) => setBookmarked(p => {
+    const next = { ...p };
+    if (next[id]) delete next[id]; else next[id] = true;
+    return next;
+  });
+
+  const allTopics = GUIDE_SECTIONS.flatMap(s => s.topics);
+  const bookmarkedCount = Object.keys(bookmarked).length;
+
+  const startQuiz = () => {
+    let pool = allTopics.map(t => t.id);
+    if (bookmarksOnly && bookmarkedCount > 0) pool = pool.filter(id => bookmarked[id]);
+    if (levelFilter !== "all") {
+      const idsByLevel = new Set(allTopics.filter(t => t.level === levelFilter).map(t => t.id));
+      pool = pool.filter(id => idsByLevel.has(id));
+    }
+    if (pool.length === 0) return;
+    // shuffle
+    for (let i = pool.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [pool[i], pool[j]] = [pool[j], pool[i]];
+    }
+    setQuizState({ ids: pool, idx: 0, results: { easy: 0, medium: 0, hard: 0 }, revealed: false });
+    trackEvent("db_quiz_start", { count: pool.length });
+  };
+
+  const quizAnswer = (rating) => {
+    if (!quizState) return;
+    const id = quizState.ids[quizState.idx];
+    setConfidence(c => ({ ...c, [id]: rating }));
+    setChecked(c => ({ ...c, [id]: true }));
+    setQuizState(s => ({
+      ...s,
+      idx: s.idx + 1,
+      revealed: false,
+      results: { ...s.results, [rating]: s.results[rating] + 1 },
+    }));
+    trackEvent("db_quiz_answer", { rating });
+  };
+
+  const updateAnalytics = (on) => {
+    setAnalyticsOn(on);
+    try { localStorage.setItem("db-analytics", on ? "granted" : "denied"); } catch { /* ignore */ }
+    setAnalyticsConsent(on ? "granted" : "denied");
+  };
+
+  const resetEverything = () => {
+    if (!window.confirm("Reset all progress? Wipes checks, bookmarks, ratings.")) return;
+    setChecked({});
+    setBookmarked({});
+    setConfidence({});
+  };
 
   const total = GUIDE_SECTIONS.reduce((a,s)=>a+s.topics.length,0);
   const done = Object.values(checked).filter(Boolean).length;
@@ -1472,7 +1549,8 @@ export default function App() {
   const filtSections = GUIDE_SECTIONS.map(s=>({...s, topics:s.topics.filter(t=>{
     const ms = !search || t.title.toLowerCase().includes(search.toLowerCase()) || t.explanation.toLowerCase().includes(search.toLowerCase());
     const ml = levelFilter==="all" || t.level===levelFilter;
-    return ms && ml;
+    const mb = !bookmarksOnly || bookmarked[t.id];
+    return ms && ml && mb;
   })})).filter(s=>s.topics.length>0);
 
   const scrollTo = id => { setActiveSection(id); setSidebarOpen(false); document.getElementById(`s-${id}`)?.scrollIntoView({behavior:"smooth",block:"start"}); };
@@ -1496,7 +1574,7 @@ export default function App() {
       {sidebarOpen && <div className="sidebar-mobile-overlay" style={{position:"fixed",inset:0,background:"rgba(0,0,0,.6)",zIndex:90}} onClick={()=>setSidebarOpen(false)}/>}
 
       {/* SIDEBAR */}
-      {tab==="guide" && (
+      {(tab==="guide") && (
         <aside className={sidebarOpen ? "sidebar-mobile" : "sidebar-desktop"} style={{width:260,minWidth:260,background:"#0f1629",borderRight:"1px solid #1e293b",display:"flex",flexDirection:"column",zIndex:100,...(sidebarOpen?{position:"fixed",left:0,top:0,bottom:0}:{})}}>
           <div style={{display:"flex",alignItems:"center",gap:10,padding:"14px 12px",borderBottom:"1px solid #1e293b"}}>
             <div style={{fontSize:22,width:36,height:36,display:"flex",alignItems:"center",justifyContent:"center",background:"linear-gradient(135deg,#f59e0b22,#f59e0b11)",borderRadius:8,border:"1px solid #f59e0b33"}}>⛁</div>
@@ -1525,23 +1603,50 @@ export default function App() {
       <main style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden"}}>
         <div style={{display:"flex",alignItems:"center",gap:8,padding:"8px 14px",borderBottom:"1px solid #1e293b",background:"#0f1629",flexWrap:"wrap"}}>
           {tab==="guide"&&<button className="menu-btn" onClick={()=>setSidebarOpen(true)} style={{display:"none",background:"transparent",border:"1px solid #1e293b",color:"#94a3b8",fontSize:16,padding:"2px 8px",borderRadius:6,cursor:"pointer"}}>☰</button>}
-          <div style={{display:"flex",gap:2,background:"#1e293b",borderRadius:7,padding:2}}>
-            {[["guide","📖 Study Guide"],["selector","🧭 DB Selector"],["cheatsheet","⚡ Rapid-Fire"]].map(([k,l])=>(
-              <button key={k} onClick={()=>setTab(k)} style={{border:"none",background:tab===k?"#334155":"transparent",color:tab===k?"#f8fafc":"#94a3b8",fontSize:11.5,fontWeight:600,padding:"5px 11px",borderRadius:5,cursor:"pointer",fontFamily:"'Outfit',sans-serif",whiteSpace:"nowrap"}}>{l}</button>
+          <div style={{display:"flex",gap:2,background:"#1e293b",borderRadius:7,padding:2,flexWrap:"wrap"}}>
+            {[["guide","📖 Study Guide"],["read","📚 Read"],["quiz","🎯 Quiz"],["selector","🧭 DB Selector"],["cheatsheet","⚡ Rapid-Fire"]].map(([k,l])=>(
+              <button key={k} onClick={()=>{setTab(k); if(k==="quiz" && !quizState) startQuiz();}} style={{border:"none",background:tab===k?"#334155":"transparent",color:tab===k?"#f8fafc":"#94a3b8",fontSize:11.5,fontWeight:600,padding:"5px 11px",borderRadius:5,cursor:"pointer",fontFamily:"'Outfit',sans-serif",whiteSpace:"nowrap"}}>{l}</button>
             ))}
           </div>
-          {tab==="guide"&&<div className="top-right" style={{display:"flex",gap:8,marginLeft:"auto",alignItems:"center"}}>
-            <div style={{position:"relative",width:180}}>
-              <span style={{position:"absolute",left:8,top:"50%",transform:"translateY(-50%)",color:"#475569",fontSize:13}}>⌕</span>
-              <input style={{width:"100%",padding:"5px 26px 5px 26px",background:"#1e293b",border:"1px solid #334155",borderRadius:6,color:"#e2e8f0",fontSize:11.5,fontFamily:"'Outfit',sans-serif",outline:"none"}} placeholder="Search..." value={search} onChange={e=>setSearch(e.target.value)}/>
-              {search&&<button onClick={()=>setSearch("")} style={{position:"absolute",right:5,top:"50%",transform:"translateY(-50%)",background:"none",border:"none",color:"#64748b",cursor:"pointer",fontSize:11}}>✕</button>}
-            </div>
-            <select style={{background:"#1e293b",border:"1px solid #334155",borderRadius:6,color:"#e2e8f0",fontSize:11.5,padding:"5px 6px",fontFamily:"'Outfit',sans-serif",outline:"none",cursor:"pointer"}} value={levelFilter} onChange={e=>setLevelFilter(e.target.value)}>
-              <option value="all">All Levels</option>
-              {Object.entries(LEVEL_COLORS).map(([k,v])=><option key={k} value={k}>{v.label}</option>)}
-            </select>
-          </div>}
+          <div className="top-right" style={{display:"flex",gap:8,marginLeft:"auto",alignItems:"center",flexWrap:"wrap"}}>
+            {(tab==="guide"||tab==="read")&&<>
+              <div style={{position:"relative",width:180}}>
+                <span style={{position:"absolute",left:8,top:"50%",transform:"translateY(-50%)",color:"#475569",fontSize:13}}>⌕</span>
+                <input style={{width:"100%",padding:"5px 26px 5px 26px",background:"#1e293b",border:"1px solid #334155",borderRadius:6,color:"#e2e8f0",fontSize:11.5,fontFamily:"'Outfit',sans-serif",outline:"none"}} placeholder="Search..." value={search} onChange={e=>setSearch(e.target.value)}/>
+                {search&&<button onClick={()=>setSearch("")} style={{position:"absolute",right:5,top:"50%",transform:"translateY(-50%)",background:"none",border:"none",color:"#64748b",cursor:"pointer",fontSize:11}}>✕</button>}
+              </div>
+              <select style={{background:"#1e293b",border:"1px solid #334155",borderRadius:6,color:"#e2e8f0",fontSize:11.5,padding:"5px 6px",fontFamily:"'Outfit',sans-serif",outline:"none",cursor:"pointer"}} value={levelFilter} onChange={e=>setLevelFilter(e.target.value)}>
+                <option value="all">All Levels</option>
+                {Object.entries(LEVEL_COLORS).map(([k,v])=><option key={k} value={k}>{v.label}</option>)}
+              </select>
+              <button
+                onClick={()=>setBookmarksOnly(v=>!v)}
+                disabled={bookmarkedCount===0}
+                title={bookmarkedCount===0?"No bookmarks yet":(bookmarksOnly?"Show all topics":"Show only bookmarked")}
+                style={{background:bookmarksOnly?"#854d0e22":"#1e293b",border:`1px solid ${bookmarksOnly?"#fbbf24":"#334155"}`,color:bookmarksOnly?"#fbbf24":(bookmarkedCount===0?"#475569":"#94a3b8"),fontSize:11.5,fontWeight:600,padding:"5px 10px",borderRadius:6,cursor:bookmarkedCount===0?"not-allowed":"pointer",fontFamily:"'Outfit',sans-serif",display:"inline-flex",alignItems:"center",gap:5}}
+              >
+                ★ {bookmarkedCount}
+              </button>
+            </>}
+            {/* Settings gear — visible on every tab */}
+            <button onClick={()=>setSettingsOpen(v=>!v)} title="Settings" aria-label="Open settings" style={{background:settingsOpen?"#334155":"#1e293b",border:`1px solid ${settingsOpen?"#475569":"#334155"}`,color:"#e2e8f0",fontSize:14,padding:"5px 9px",borderRadius:6,cursor:"pointer",fontFamily:"'Outfit',sans-serif",display:"inline-flex",alignItems:"center",gap:6}}>
+              {username
+                ? <span style={{width:18,height:18,borderRadius:"50%",background:"linear-gradient(135deg,#f59e0b,#d97706)",color:"#0b0f1a",fontSize:11,fontWeight:800,display:"inline-flex",alignItems:"center",justifyContent:"center"}}>{username.charAt(0).toUpperCase()}</span>
+                : <span style={{fontSize:13}}>⚙</span>}
+              <span style={{fontSize:11,color:"#94a3b8"}}>{username||"Settings"}</span>
+            </button>
+          </div>
         </div>
+
+        {/* SETTINGS POPOVER */}
+        {settingsOpen && <SettingsPanel
+          username={username}
+          onUsernameChange={setUsername}
+          analyticsOn={analyticsOn}
+          onAnalyticsChange={updateAnalytics}
+          onReset={resetEverything}
+          onClose={()=>setSettingsOpen(false)}
+        />}
 
         <div className="content-area" style={{flex:1,overflow:"auto",padding:"18px 22px 60px"}}>
 
@@ -1557,6 +1662,7 @@ export default function App() {
                 </div>
                 {section.topics.map(topic=>{
                   const isDone=checked[topic.id], isOpen=expanded[topic.id]!==false, showCode=codeOpen[topic.id], lv=LEVEL_COLORS[topic.level];
+                  const isBookmarked=!!bookmarked[topic.id];
                   return(
                     <div key={topic.id} style={{background:isDone?"#0b1a14":"#111827",border:`1px solid ${isDone?"#065f46":"#1e293b"}`,borderRadius:11,marginBottom:7,overflow:"hidden",transition:"all .25s"}}>
                       <div onClick={()=>setExpanded(p=>({...p,[topic.id]:!isOpen}))} style={{display:"flex",alignItems:"center",gap:9,padding:"12px 14px",cursor:"pointer"}}>
@@ -1565,6 +1671,7 @@ export default function App() {
                         </button>
                         <h3 style={{flex:1,fontSize:13.5,fontWeight:600,color:isDone?"#34d399":"#f1f5f9",lineHeight:1.4}}>{topic.title}</h3>
                         <span style={{fontSize:8.5,fontWeight:700,padding:"2px 6px",borderRadius:4,textTransform:"uppercase",letterSpacing:".04em",background:lv.bg,color:lv.text,border:`1px solid ${lv.border}`,flexShrink:0}}>{lv.label}</span>
+                        <button onClick={e=>{e.stopPropagation();toggleBookmark(topic.id)}} title={isBookmarked?"Remove bookmark":"Bookmark"} aria-label={isBookmarked?"Remove bookmark":"Bookmark"} style={{background:"transparent",border:"none",padding:"2px 4px",cursor:"pointer",fontSize:15,lineHeight:1,color:isBookmarked?"#fbbf24":"#475569",transition:"color .2s"}}>{isBookmarked?"★":"☆"}</button>
                         <span style={{color:"#475569",fontSize:11,width:16,textAlign:"center"}}>{isOpen?"▾":"▸"}</span>
                       </div>
                       {isOpen&&<div style={{padding:"0 14px 14px 44px",animation:"fadeUp .2s ease"}}>
@@ -1634,8 +1741,253 @@ export default function App() {
             {CHEAT.map((c,i)=><CheatCard key={i} item={c}/>)}
           </div>}
 
+          {/* QUIZ TAB */}
+          {tab==="quiz" && <QuizPanel
+            quizState={quizState}
+            allTopics={allTopics}
+            bookmarked={bookmarked}
+            onReveal={()=>setQuizState(s=>({...s, revealed:true}))}
+            onAnswer={quizAnswer}
+            onRestart={startQuiz}
+            onExit={()=>{ setQuizState(null); setTab("guide"); }}
+          />}
+
+          {/* READ (LECTURE) TAB */}
+          {tab==="read" && <ReadPanel
+            sections={filtSections}
+            bookmarked={bookmarked}
+            onToggleBookmark={toggleBookmark}
+            fontScale={readFontScale}
+            onFontScaleChange={setReadFontScale}
+          />}
+
         </div>
       </main>
+    </div>
+  );
+}
+
+// ============== SETTINGS PANEL ==============
+function SettingsPanel({ username, onUsernameChange, analyticsOn, onAnalyticsChange, onReset, onClose }) {
+  const [draft, setDraft] = useState(username);
+  useEffect(()=>{ setDraft(username); }, [username]);
+  const dirty = draft.trim() !== (username||"").trim();
+  const commit = ()=>{ const clean = draft.trim().slice(0,32); setDraft(clean); onUsernameChange(clean); };
+  const gaConfigured = !!import.meta.env.VITE_GA_ID;
+  return (
+    <>
+      <div onClick={onClose} style={{position:"fixed",inset:0,background:"rgba(0,0,0,.4)",zIndex:200}}/>
+      <div style={{
+        position:"fixed",
+        top:60, right:20,
+        width:340,
+        background:"#0f1629",
+        border:"1px solid #334155",
+        borderRadius:12,
+        padding:18,
+        zIndex:210,
+        boxShadow:"0 24px 60px rgba(0,0,0,.6)",
+        fontFamily:"'Outfit',sans-serif",
+      }}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:14}}>
+          <h3 style={{fontSize:14,fontWeight:700,color:"#f8fafc",margin:0}}>Settings</h3>
+          <button onClick={onClose} style={{background:"transparent",border:"none",color:"#94a3b8",cursor:"pointer",fontSize:16}}>✕</button>
+        </div>
+
+        {/* USERNAME */}
+        <div style={{marginBottom:18}}>
+          <div style={{fontSize:10,fontWeight:700,color:"#64748b",textTransform:"uppercase",letterSpacing:".06em",marginBottom:8}}>Display name</div>
+          <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:8}}>
+            <div style={{width:36,height:36,borderRadius:"50%",background:"linear-gradient(135deg,#f59e0b,#d97706)",color:"#0b0f1a",fontSize:15,fontWeight:800,display:"inline-flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>
+              {(username||"?").charAt(0).toUpperCase()}
+            </div>
+            <input
+              type="text"
+              value={draft}
+              onChange={e=>setDraft(e.target.value)}
+              onBlur={commit}
+              onKeyDown={e=>{ if(e.key==="Enter"){ commit(); e.currentTarget.blur(); } }}
+              maxLength={32}
+              placeholder="e.g. Andrei"
+              style={{flex:1,background:"#1e293b",border:"1px solid #334155",borderRadius:6,color:"#e2e8f0",fontSize:13,padding:"8px 10px",fontFamily:"'Outfit',sans-serif",outline:"none"}}
+            />
+            {dirty && <button onClick={commit} style={{background:"#f59e0b",color:"#0b0f1a",border:"none",borderRadius:6,padding:"7px 12px",fontSize:11,fontWeight:700,cursor:"pointer",fontFamily:"'Outfit',sans-serif"}}>Save</button>}
+          </div>
+          <div style={{fontSize:10,color:"#475569"}}>Stored locally. Max 32 characters.</div>
+        </div>
+
+        {/* ANALYTICS */}
+        {gaConfigured && (
+          <div style={{marginBottom:18,padding:"12px 0",borderTop:"1px solid #1e293b",borderBottom:"1px solid #1e293b"}}>
+            <div style={{display:"flex",alignItems:"center",gap:10}}>
+              <div style={{flex:1}}>
+                <div style={{fontSize:12,fontWeight:600,color:"#e2e8f0",marginBottom:2}}>Anonymous analytics</div>
+                <div style={{fontSize:10,color:"#64748b",lineHeight:1.5}}>Helps me see which topics are popular. No ads, no resold data.</div>
+              </div>
+              <button
+                onClick={()=>onAnalyticsChange(!analyticsOn)}
+                aria-pressed={analyticsOn}
+                style={{width:40,height:22,background:analyticsOn?"#f59e0b":"#334155",border:"none",borderRadius:11,position:"relative",cursor:"pointer",transition:"background .2s",flexShrink:0}}
+              >
+                <span style={{position:"absolute",top:3,left:analyticsOn?20:3,width:16,height:16,background:"#fff",borderRadius:"50%",transition:"left .2s",boxShadow:"0 1px 3px rgba(0,0,0,.3)"}}/>
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* RESET */}
+        <button onClick={onReset} style={{background:"#1f0a0a",color:"#f87171",border:"1px solid #7f1d1d",borderRadius:6,padding:"9px 14px",fontSize:11,fontWeight:600,cursor:"pointer",fontFamily:"'Outfit',sans-serif",width:"100%"}}>
+          ↺ Reset all progress
+        </button>
+      </div>
+    </>
+  );
+}
+
+// ============== QUIZ PANEL ==============
+function QuizPanel({ quizState, allTopics, bookmarked, onReveal, onAnswer, onRestart, onExit }) {
+  if (!quizState) {
+    return (
+      <div style={{maxWidth:560,margin:"40px auto",textAlign:"center",padding:"32px 24px",background:"#0f1629",border:"1px solid #1e293b",borderRadius:14,fontFamily:"'Outfit',sans-serif"}}>
+        <div style={{fontSize:48,marginBottom:12}}>🎯</div>
+        <h2 style={{fontSize:22,fontWeight:800,color:"#f8fafc",marginBottom:8}}>Quiz mode</h2>
+        <p style={{color:"#94a3b8",fontSize:13,marginBottom:24,lineHeight:1.65}}>One topic at a time. Think about your answer, reveal, rate how well you knew it. Your ratings sync into the main checklist.</p>
+        <button onClick={onRestart} style={{background:"linear-gradient(135deg,#f59e0b,#d97706)",color:"#0b0f1a",border:"none",borderRadius:8,padding:"12px 28px",fontSize:14,fontWeight:700,cursor:"pointer",fontFamily:"'Outfit',sans-serif"}}>▶ Start quiz</button>
+      </div>
+    );
+  }
+  const finished = quizState.idx >= quizState.ids.length;
+  if (finished) {
+    const { easy, medium, hard } = quizState.results;
+    return (
+      <div style={{maxWidth:520,margin:"40px auto",padding:"32px 24px",background:"#0f1629",border:"1px solid #1e293b",borderRadius:14,textAlign:"center",fontFamily:"'Outfit',sans-serif"}}>
+        <div style={{fontSize:48,marginBottom:12}}>🏆</div>
+        <h2 style={{fontSize:22,fontWeight:800,color:"#f8fafc",marginBottom:6}}>Quiz complete</h2>
+        <p style={{color:"#94a3b8",fontSize:13,marginBottom:22}}>You went through {quizState.ids.length} topic{quizState.ids.length===1?"":"s"}.</p>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginBottom:24}}>
+          <div style={{background:"#0b1a14",border:"1px solid #065f46",borderRadius:10,padding:"14px 8px"}}>
+            <div style={{fontSize:24,fontWeight:800,color:"#34d399",lineHeight:1}}>{easy}</div>
+            <div style={{fontSize:10,color:"#34d399",marginTop:4,textTransform:"uppercase",letterSpacing:".05em",fontWeight:700}}>Easy</div>
+          </div>
+          <div style={{background:"#1a1308",border:"1px solid #854d0e",borderRadius:10,padding:"14px 8px"}}>
+            <div style={{fontSize:24,fontWeight:800,color:"#fbbf24",lineHeight:1}}>{medium}</div>
+            <div style={{fontSize:10,color:"#fbbf24",marginTop:4,textTransform:"uppercase",letterSpacing:".05em",fontWeight:700}}>Medium</div>
+          </div>
+          <div style={{background:"#1a0808",border:"1px solid #7f1d1d",borderRadius:10,padding:"14px 8px"}}>
+            <div style={{fontSize:24,fontWeight:800,color:"#f87171",lineHeight:1}}>{hard}</div>
+            <div style={{fontSize:10,color:"#f87171",marginTop:4,textTransform:"uppercase",letterSpacing:".05em",fontWeight:700}}>Hard</div>
+          </div>
+        </div>
+        <div style={{display:"flex",gap:8,justifyContent:"center"}}>
+          <button onClick={onRestart} style={{background:"linear-gradient(135deg,#f59e0b,#d97706)",color:"#0b0f1a",border:"none",borderRadius:8,padding:"10px 20px",fontSize:13,fontWeight:700,cursor:"pointer",fontFamily:"'Outfit',sans-serif"}}>↻ Another round</button>
+          <button onClick={onExit} style={{background:"#1e293b",color:"#e2e8f0",border:"1px solid #334155",borderRadius:8,padding:"10px 20px",fontSize:13,fontWeight:600,cursor:"pointer",fontFamily:"'Outfit',sans-serif"}}>Back to guide</button>
+        </div>
+      </div>
+    );
+  }
+
+  const id = quizState.ids[quizState.idx];
+  const topic = allTopics.find(t=>t.id===id);
+  if (!topic) return <div>Topic {id} not found</div>;
+  const lv = LEVEL_COLORS[topic.level];
+  const pct = (quizState.idx / quizState.ids.length) * 100;
+
+  return (
+    <div style={{maxWidth:680,margin:"0 auto",fontFamily:"'Outfit',sans-serif"}}>
+      {/* progress */}
+      <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:18}}>
+        <div style={{flex:1,height:6,background:"#1e293b",borderRadius:3,overflow:"hidden"}}>
+          <div style={{width:`${pct}%`,height:"100%",background:"linear-gradient(90deg,#f59e0b,#d97706)",transition:"width .3s"}}/>
+        </div>
+        <span style={{fontSize:11,color:"#94a3b8",fontFamily:"'JetBrains Mono',monospace",fontWeight:600}}>{quizState.idx+1}/{quizState.ids.length}</span>
+        <button onClick={onExit} style={{background:"transparent",border:"1px solid #334155",color:"#94a3b8",fontSize:11,padding:"3px 9px",borderRadius:5,cursor:"pointer",fontFamily:"'Outfit',sans-serif"}}>✕ exit</button>
+      </div>
+
+      {/* card */}
+      <div style={{background:"#0f1629",border:"1px solid #1e293b",borderRadius:14,padding:"24px 24px 20px",animation:"fadeUp .25s ease"}}>
+        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:14,flexWrap:"wrap"}}>
+          <span style={{fontSize:9,fontWeight:700,padding:"3px 7px",borderRadius:4,textTransform:"uppercase",letterSpacing:".04em",background:lv.bg,color:lv.text,border:`1px solid ${lv.border}`}}>{lv.label}</span>
+          {bookmarked[topic.id] && <span style={{color:"#fbbf24",fontSize:13}}>★</span>}
+        </div>
+        <h2 style={{fontSize:20,fontWeight:800,color:"#f8fafc",marginBottom:18,lineHeight:1.3}}>{topic.title}</h2>
+        {!quizState.revealed ? (
+          <div style={{padding:"36px 16px",textAlign:"center"}}>
+            <div style={{fontSize:36,marginBottom:14}}>💭</div>
+            <p style={{color:"#94a3b8",fontSize:13,marginBottom:18}}>Think it through, then reveal.</p>
+            <button onClick={onReveal} style={{background:"linear-gradient(135deg,#f59e0b,#d97706)",color:"#0b0f1a",border:"none",borderRadius:8,padding:"11px 26px",fontSize:13,fontWeight:700,cursor:"pointer",fontFamily:"'Outfit',sans-serif"}}>Reveal answer</button>
+          </div>
+        ) : (
+          <div>
+            <div style={{background:"#0c1425",border:"1px solid #1e293b",borderRadius:9,padding:"14px 16px",marginBottom:10,fontSize:13,lineHeight:1.75,color:"#94a3b8",whiteSpace:"pre-wrap"}}>
+              {topic.explanation}
+            </div>
+            {topic.production && <div style={{background:"#1a1308",border:"1px solid #854d0e44",borderRadius:9,padding:"14px 16px",fontSize:13,lineHeight:1.75,color:"#d4a574",whiteSpace:"pre-wrap"}}>
+              {topic.production}
+            </div>}
+
+            <div style={{marginTop:20,paddingTop:16,borderTop:"1px solid #1e293b"}}>
+              <div style={{fontSize:11,color:"#64748b",fontWeight:600,textTransform:"uppercase",letterSpacing:".06em",marginBottom:10,textAlign:"center"}}>How well did you know it?</div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8}}>
+                <button onClick={()=>onAnswer("hard")}   style={{background:"#1a0808",color:"#f87171",border:"1px solid #7f1d1d",borderRadius:10,padding:"14px 8px",fontSize:13,fontWeight:700,cursor:"pointer",fontFamily:"'Outfit',sans-serif"}}>😴 Hard</button>
+                <button onClick={()=>onAnswer("medium")} style={{background:"#1a1308",color:"#fbbf24",border:"1px solid #854d0e",borderRadius:10,padding:"14px 8px",fontSize:13,fontWeight:700,cursor:"pointer",fontFamily:"'Outfit',sans-serif"}}>🤔 Medium</button>
+                <button onClick={()=>onAnswer("easy")}   style={{background:"#0b1a14",color:"#34d399",border:"1px solid #065f46",borderRadius:10,padding:"14px 8px",fontSize:13,fontWeight:700,cursor:"pointer",fontFamily:"'Outfit',sans-serif"}}>😎 Easy</button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ============== READ (LECTURE) PANEL ==============
+function ReadPanel({ sections, bookmarked, onToggleBookmark, fontScale, onFontScaleChange }) {
+  return (
+    <div style={{maxWidth:760,margin:"0 auto",fontFamily:"'Outfit',sans-serif",fontSize:`${fontScale}rem`}}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:18}}>
+        <div>
+          <div style={{fontSize:11,color:"#64748b",fontWeight:700,textTransform:"uppercase",letterSpacing:".08em"}}>Lecture mode</div>
+          <h2 style={{fontSize:24,fontWeight:800,color:"#f8fafc",marginTop:4}}>Read everything top-to-bottom</h2>
+          <p style={{color:"#94a3b8",fontSize:13,marginTop:4}}>No checkboxes, no quiz — just absorb.</p>
+        </div>
+        <button onClick={()=>onFontScaleChange(fontScale===1?1.15:fontScale===1.15?1.3:1)} title={`Font size ${Math.round(fontScale*100)}%`} aria-label="Change font size" style={{background:"#1e293b",border:"1px solid #334155",color:"#e2e8f0",borderRadius:6,padding:"7px 12px",cursor:"pointer",fontFamily:"'Outfit',sans-serif",fontSize:13,fontWeight:800}}>A</button>
+      </div>
+
+      {sections.length===0&&<div style={{textAlign:"center",padding:60,color:"#64748b"}}>Nothing matches the current filter.</div>}
+
+      {sections.map(section=>(
+        <div key={section.id} style={{marginBottom:36}}>
+          <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:14,paddingBottom:8,borderBottom:"1px solid #1e293b"}}>
+            <span style={{fontSize:24}}>{section.icon}</span>
+            <h2 style={{fontSize:"1.2em",fontWeight:800,color:"#f8fafc"}}>{section.title}</h2>
+          </div>
+          {section.topics.map(topic=>{
+            const lv = LEVEL_COLORS[topic.level];
+            const isBM = !!bookmarked[topic.id];
+            return (
+              <article key={topic.id} style={{background:"#0f1629",border:"1px solid #1e293b",borderRadius:14,padding:"20px 22px",marginBottom:14}}>
+                <div style={{display:"flex",alignItems:"flex-start",gap:10,marginBottom:12}}>
+                  <h3 style={{flex:1,fontSize:"1.15em",fontWeight:800,color:"#f8fafc",lineHeight:1.3}}>{topic.title}</h3>
+                  <span style={{fontSize:9,fontWeight:700,padding:"3px 7px",borderRadius:4,textTransform:"uppercase",letterSpacing:".04em",background:lv.bg,color:lv.text,border:`1px solid ${lv.border}`,flexShrink:0}}>{lv.label}</span>
+                  <button onClick={()=>onToggleBookmark(topic.id)} title={isBM?"Remove bookmark":"Bookmark"} style={{background:"transparent",border:"none",cursor:"pointer",color:isBM?"#fbbf24":"#475569",fontSize:18,padding:0,lineHeight:1}}>{isBM?"★":"☆"}</button>
+                </div>
+                <div style={{fontSize:"0.95em",color:"#94a3b8",lineHeight:1.8,whiteSpace:"pre-wrap",marginBottom:topic.production?12:0}}>
+                  {topic.explanation}
+                </div>
+                {topic.production && <div style={{background:"#1a130822",border:"1px solid #854d0e44",borderRadius:9,padding:"12px 14px",fontSize:"0.9em",color:"#d4a574",lineHeight:1.75,whiteSpace:"pre-wrap"}}>
+                  {topic.production}
+                </div>}
+                {topic.code && <pre style={{marginTop:12,padding:"12px 14px",background:"#080c15",border:"1px solid #1e293b",borderRadius:8,overflow:"auto",fontSize:"0.78em",lineHeight:1.7,fontFamily:"'JetBrains Mono',monospace",color:"#8be9fd",maxHeight:380}}><code>{topic.code}</code></pre>}
+              </article>
+            );
+          })}
+        </div>
+      ))}
+
+      <div style={{textAlign:"center",padding:"30px 0 50px",color:"#64748b"}}>
+        <div style={{fontSize:32,marginBottom:8}}>📖</div>
+        <div style={{fontSize:13,fontWeight:600}}>That's everything in scope. Nice read.</div>
+      </div>
     </div>
   );
 }
